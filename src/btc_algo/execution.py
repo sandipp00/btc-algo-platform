@@ -1,44 +1,47 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from uuid import uuid4
+from dataclasses import dataclass
+from enum import StrEnum
 
-from .config import Settings, TradingMode
-from .exchange import ExchangeAdapter
-from .models import Order, OrderType, Side
+from btc_algo.domain import OrderSide, OrderStatus
+
+
+class ExecutionMode(StrEnum):
+    PAPER = "paper"
+    TESTNET = "testnet"
+    LIVE = "live"
+
+
+@dataclass(frozen=True)
+class ExecutionResult:
+    client_order_id: str
+    status: OrderStatus
+    exchange_order_id: str | None = None
+    filled_quantity: float = 0.0
+    average_fill_price: float | None = None
 
 
 class ExecutionEngine:
-    """Single entry point for order submission. Live mode is explicitly gated."""
+    """Order-state boundary. Live trading remains opt-in and is not implemented here."""
 
-    def __init__(self, settings: Settings, exchange: ExchangeAdapter) -> None:
-        self.settings = settings
-        self.exchange = exchange
-        self._submitted: set[str] = set()
+    def __init__(self, mode: ExecutionMode = ExecutionMode.PAPER, live_enabled: bool = False) -> None:
+        if mode is ExecutionMode.LIVE and not live_enabled:
+            raise RuntimeError("LIVE execution requires explicit live_enabled=True")
+        self.mode = mode
+        self.live_enabled = live_enabled
+        self._orders: dict[str, ExecutionResult] = {}
 
-    async def submit_market(self, symbol: str, side: Side, quantity: float) -> Order:
-        if quantity <= 0:
-            raise ValueError("quantity must be positive")
-        self.settings.validate_live_gate()
-        if self.settings.mode not in (TradingMode.TESTNET, TradingMode.LIVE):
-            raise RuntimeError("exchange execution is disabled outside testnet/live modes")
+    async def submit(self, *, client_order_id: str, symbol: str, side: OrderSide, quantity: float, price: float | None = None) -> ExecutionResult:
+        if not client_order_id or not symbol or quantity <= 0:
+            raise ValueError("client_order_id, symbol and positive quantity are required")
+        existing = self._orders.get(client_order_id)
+        if existing is not None:
+            return existing
+        if self.mode is ExecutionMode.LIVE:
+            raise NotImplementedError("Live exchange submission is disabled until adapter and reconciliation are validated")
+        result = ExecutionResult(client_order_id, OrderStatus.FILLED, filled_quantity=quantity, average_fill_price=price)
+        self._orders[client_order_id] = result
+        return result
 
-        client_order_id = f"btc-{uuid4().hex}"
-        if client_order_id in self._submitted:
-            raise RuntimeError("duplicate client order id")
-        order = Order(
-            client_order_id=client_order_id,
-            symbol=symbol,
-            side=side,
-            order_type=OrderType.MARKET,
-            quantity=quantity,
-            created_at=datetime.now(timezone.utc),
-        )
-        self._submitted.add(client_order_id)
-        try:
-            result = await self.exchange.create_order(order)
-        except Exception:
-            self._submitted.discard(client_order_id)
-            raise
-        order.exchange_order_id = str(result.get("id")) if result.get("id") is not None else None
-        return order
+    def get(self, client_order_id: str) -> ExecutionResult | None:
+        return self._orders.get(client_order_id)
